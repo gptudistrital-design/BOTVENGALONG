@@ -304,6 +304,16 @@ CONTINUATION_TP_USD = 10.0
 LONG_SL_MODES = {"short_entry": "Entrada del short", "short_tp": "TP del short"}
 LONG_SL_REFERENCE = "short_entry"
 
+# Long espejo: se abre cuando el short cruza el nivel MIRROR_LEVELS[0] (100%). Editable desde la web.
+#   LONG_MIRROR_MATCH_SHORT: True = el long entra con TODO el notional que el short lleva en ese
+#       momento (fills 50 + 75 + 100 = 20 USDT), todo al precio actual. False = solo con el fill
+#       del nivel 100 (comportamiento anterior).
+#   LONG_MIRROR_TP_USD: TP propio del long espejo en USD (> 0). 0 = sin TP propio: el long solo
+#       sale por su SL o cuando se cierra el short (comportamiento anterior).
+LONG_MIRROR_MATCH_SHORT = os.getenv("LONG_MIRROR_MATCH_SHORT", "true").lower() == "true"
+LONG_MIRROR_TP_USD = max(0.0, float(os.getenv("LONG_MIRROR_TP_USD", "1.0")))
+LONG_MIRROR_TP_MAX = 100000.0
+
 # Stop loss del PRIMER tramo: pérdida máxima = notional del primer fill × 0.251.
 # Ej.: primer tramo de 5 USDT → SL = -1.255 USD. Al abrirse el 2.º tramo la
 # posición vuelve al SL estándar (DEFAULT_STOP_LOSS_USD). Un SL fijado a mano
@@ -378,6 +388,7 @@ def _apply_settings(data: dict) -> None:
     global REVENGE_ENABLED, REVENGE_MULT, REVENGE_RECOVER_PCT, REVENGE_SL_PCT, REVENGE_DIRECTION
     global REVENGE_SL_USD, REVENGE_SL_MODE
     global EXECUTOR_URL, LONG_SL_REFERENCE
+    global LONG_MIRROR_MATCH_SHORT, LONG_MIRROR_TP_USD
     if not isinstance(data, dict):
         return
     for key, val in data.items():
@@ -437,6 +448,14 @@ def _apply_settings(data: dict) -> None:
                 if not isinstance(val, str) or val not in LONG_SL_MODES:
                     continue
                 LONG_SL_REFERENCE = val
+            elif key == "long_mirror_match_short":
+                val = bool(val)
+                LONG_MIRROR_MATCH_SHORT = val
+            elif key == "long_mirror_tp_usd":
+                val = float(val)
+                if not isfinite(val) or not 0 <= val <= LONG_MIRROR_TP_MAX:
+                    continue
+                LONG_MIRROR_TP_USD = val
             else:
                 continue
         except (TypeError, ValueError, AttributeError):
@@ -569,6 +588,8 @@ class BotPosition:
             return self.tp_manual_usd
         if self.revenge:
             return self.tp_usd
+        if self.phase == "mirror" and LONG_MIRROR_TP_USD > 0:
+            return LONG_MIRROR_TP_USD
         if self.phase:
             return self.tp_usd
         override = TP_OVERRIDES.get(len(self.fills))
@@ -582,6 +603,8 @@ class BotPosition:
             return "manual"
         if self.revenge:
             return "venganza"
+        if self.phase == "mirror" and LONG_MIRROR_TP_USD > 0:
+            return "TP fijo"
         if self.phase:
             return "SL del short" if self.phase == "mirror" else "reentrada"
         return "tramo fijo" if len(self.fills) in TP_OVERRIDES else "auto"
@@ -1515,15 +1538,21 @@ class TradingBot:
             elif not pos.trade_id:
                 pos.trade_id = self._next_trade_id()
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
+            previous_fills = list(pos.fills)        # tramos del short ANTES de este (50, 75…)
             pos.fills.append(fill)
             pos.refresh_auto_sl()
+            catch_up: List[Fill] = []
+            catch_up_errors: List[str] = []
             if level == MIRROR_LEVELS[0] and long is None and mirror_allowed:
                 long = BotPosition(symbol=symbol, side="LONG", trade_id=self._next_trade_id(),
                                    phase="mirror", parent_trade_id=pos.trade_id)
                 self.long_positions[symbol] = long
+                if LONG_MIRROR_MATCH_SHORT:
+                    catch_up, catch_up_errors = self._mirror_catch_up_fills(symbol, previous_fills, price)
             mirror_fill = (long is not None and long.phase == "mirror"
                            and long.parent_trade_id == pos.trade_id and level in MIRROR_LEVELS)
             if mirror_fill:
+                long.fills.extend(catch_up)         # primero 50, 75…; el fill actual siempre el último
                 long.fills.append(fill)
             self._refresh_long_targets(pos, long)
 
@@ -1533,10 +1562,30 @@ class TradingBot:
             f"qty={qty} | px={price:.6f} | cambio(WS)={change:.2f}% | trade_id={pos.trade_id} | "
             f"tramos={len(pos.fills)} | SL={pos.sl_usd:.4f} USD ({pos.sl_mode})"
         )
+        for err in catch_up_errors:                 # fuera del lock: log() lo toma
+            self.log(err)
         if mirror_fill:
-            self._notify_long_open(long, fill)
+            for long_fill in (*catch_up, fill):
+                self._notify_long_open(long, long_fill)
         self.persist_state()
         return True
+
+    def _mirror_catch_up_fills(self, symbol: str, previous_fills: List[Fill],
+                               price: float) -> Tuple[List[Fill], List[str]]:
+        """Fills que el long espejo replica de los tramos que el short ya tenía (50, 75…): mismo
+        notional de cada tramo, pero al PRECIO ACTUAL (el long no puede entrar en el pasado).
+        Llamar con self.lock tomado: no loguea, devuelve los errores para loguearlos fuera."""
+        out: List[Fill] = []
+        errors: List[str] = []
+        for prev in sorted(previous_fills, key=lambda f: f.level):
+            try:
+                qty = self.client.order_quantity(symbol, prev.notional, price)
+            except (ValueError, RuntimeError) as exc:
+                self.last_error = str(exc)
+                errors.append(f"Long espejo {symbol}: no pude replicar el tramo {prev.level:.0f}: {exc}")
+                continue
+            out.append(Fill(level=prev.level, notional=prev.notional, entry_price=price, qty=qty))
+        return out, errors
 
     @staticmethod
     def _refresh_long_targets(short: Optional[BotPosition], long: Optional[BotPosition]) -> None:
@@ -1581,6 +1630,9 @@ class TradingBot:
             if pnl < long.sl_usd - 1e-9 or (pnl <= long.sl_usd + 1e-9 and was_above_stop):
                 reason = "SL"
             elif long.phase == "continuation" and pnl >= long.target_usd() - 1e-9:
+                reason = "TP"
+            elif (long.phase == "mirror" and LONG_MIRROR_TP_USD > 0
+                  and pnl >= long.target_usd() - 1e-9):
                 reason = "TP"
             else:
                 return
@@ -1930,6 +1982,43 @@ class TradingBot:
         for symbol in symbols:
             self._enqueue(symbol)
         return reference
+
+    def set_long_mirror_settings(self, match_short: Optional[bool] = None,
+                                 tp_usd: Optional[float] = None) -> dict:
+        """Long espejo en caliente. El TP se aplica ya a los longs abiertos; 'match_short'
+        solo afecta a los longs que se abran a partir de ahora."""
+        changes: Dict[str, Any] = {}
+        if match_short is not None:
+            changes["long_mirror_match_short"] = bool(match_short)
+        if tp_usd is not None:
+            changes["long_mirror_tp_usd"] = float(tp_usd)
+        with self.lock:
+            _apply_settings(changes)
+            symbols = list(self.long_positions)
+            for symbol, long in self.long_positions.items():
+                self._refresh_long_targets(self.positions.get(symbol), long)
+        self._save_settings()
+        cfg = self.long_mirror_config()
+        self.log(f"Long espejo: {'entra con el notional del short' if cfg['match_short'] else 'solo fill del nivel 100'}"
+                 f" ({cfg['entry_notional']:g} USDT) | "
+                 f"TP {'+%g USD' % cfg['tp_usd'] if cfg['tp_usd'] > 0 else 'sin TP propio'}")
+        self.persist_state()
+        for symbol in symbols:
+            self._enqueue(symbol)           # reevalúa ya con el nuevo TP
+        return cfg
+
+    @staticmethod
+    def long_mirror_config() -> dict:
+        """Config del long espejo + notional con el que entraría (para mostrarlo en la web)."""
+        lvl0 = MIRROR_LEVELS[0]
+        levels = [lv for lv in ENTRY_LEVELS if lv <= lvl0]
+        notionals = [nt for lv, nt in zip(ENTRY_LEVELS, ENTRY_NOTIONALS) if lv <= lvl0]
+        only_level = [nt for lv, nt in zip(ENTRY_LEVELS, ENTRY_NOTIONALS) if lv == lvl0]
+        full = sum(notionals)
+        return {"match_short": LONG_MIRROR_MATCH_SHORT, "tp_usd": LONG_MIRROR_TP_USD,
+                "mirror_level": lvl0, "levels": levels, "full_notional": full,
+                "level_notional": sum(only_level),
+                "entry_notional": full if LONG_MIRROR_MATCH_SHORT else sum(only_level)}
 
     def _save_settings(self) -> None:
         """Guarda en disco los ajustes cambiados desde la web (también viajan en
@@ -2352,6 +2441,7 @@ class TradingBot:
             "revenge":           self.revenge_config(),
             "default_stop_loss_usd":      DEFAULT_STOP_LOSS_USD,
             "long_sl_reference": LONG_SL_REFERENCE,
+            "long_mirror":       self.long_mirror_config(),
             "first_tranche_sl_fraction":  FIRST_TRANCHE_SL_FRACTION,
             "total_unrealized":   sum(unrealized.values()),
             "total_realized_pnl": total_realized_pnl,
@@ -2694,6 +2784,7 @@ class TradingBot:
                    persisted.get("scan_count", 0) > live.get("scan_count", 0):
                     persisted["state_source"] = "persisted"
                     persisted["long_sl_reference"] = LONG_SL_REFERENCE
+                    persisted["long_mirror"] = self.long_mirror_config()
                     return persisted
             except Exception:
                 pass
@@ -3040,6 +3131,18 @@ HTML = r"""<!doctype html>
         </div>
         <p class="note">Referencia de precio para el SL del long espejo y su reentrada.</p>
         <div id="longSlMsg" class="msg" style="margin:0" role="status"></div>
+      </article>
+
+      <article id="sec-long-mirror" class="card cfg rvcard">
+        <div class="cfg-top">
+          <span class="cfg-title">🪞 Long espejo <span id="lmState" class="revtag">—</span></span>
+        </div>
+        <div class="rvrow"><span>Entrar con el notional del short</span>
+          <span class="rvctl"><label class="switch" title="Activar: el long entra con todos los fills que el short ya tiene"><input id="lmMatch" type="checkbox"><span></span></label></span></div>
+        <div class="rvrow"><span>Take Profit del long (0 = sin TP)</span>
+          <span class="rvctl" style="flex-wrap:nowrap"><input id="lmTpIn" type="number" min="0" step="0.1" inputmode="decimal" aria-label="Take Profit del long espejo en USD (0 = sin TP propio)"><span class="unit">USD</span></span></div>
+        <div id="lmMsg" class="msg" style="margin:0" role="status"></div>
+        <p class="note" id="lmNote">—</p>
       </article>
 
       <article id="sec-tp" class="card cfg tpcard">
@@ -3401,6 +3504,7 @@ function render(d) {
     longSl.value = d.long_sl_reference === 'short_tp' ? 'short_tp' : 'short_entry';
   }
   renderTpConfig(d.tp_config);
+  renderLongMirror(d.long_mirror);
   renderRevenge(d.revenge, defSl);
   setTxt('exCurrent', d.executor_url || 'sin configurar');
   setTxt('exState', d.executor_url ? 'activo' : 'off');
@@ -3767,6 +3871,67 @@ function editTrancheTp(nTr) {
   });
 }
 
+// ── Long espejo ─────────────────────────────────────────────────────────────
+let _lm = null;
+function renderLongMirror(lm) {
+  if (!lm) return;
+  _lm = lm;
+  const match = !!lm.match_short, tp = n(lm.tp_usd), lvl = n(lm.mirror_level);
+  const sw = q('lmMatch');
+  if (sw && !sw.dataset.busy) sw.checked = match;
+  const inp = q('lmTpIn');
+  if (inp && document.activeElement !== inp) inp.value = String(tp);
+  setTxt('lmState', match ? 'notional del short' : 'solo fill ' + fx(lvl, 0));
+  q('lmState').style.opacity = match ? '1' : '.55';
+  q('sec-long-mirror').classList.toggle('on', match);
+  const lv = (Array.isArray(lm.levels) ? lm.levels : []).map(x => fx(x, 0)).join(' + ');
+  q('lmNote').textContent =
+    (match
+      ? `Al cruzar el nivel ${fx(lvl, 0)} el long entra con el notional que el short lleva en ese momento: ` +
+        `fills ${lv} = ${fx(lm.full_notional, 2)} USDT, todos al precio actual. `
+      : `El long entra solo con el fill del nivel ${fx(lvl, 0)} (${fx(lm.level_notional, 2)} USDT). `) +
+    (tp > 0 ? `Cierra con TP de +${fx(tp, 2)} USD. `
+            : 'Sin TP propio: sale por su SL o al cerrarse el short. ') +
+    'El interruptor solo afecta a longs nuevos; el TP se aplica ya a los abiertos.';
+}
+
+async function setLongMirror(body) {
+  const msg = q('lmMsg');
+  msg.className = 'msg'; msg.textContent = '…';
+  try {
+    const resp = await fetch('/api/set-long-mirror', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (data.ok) { msg.textContent = ''; renderLongMirror(data); requestFull(true); }
+    else { msg.className = 'msg negative'; msg.textContent = data.error || `Error HTTP ${resp.status}`; }
+  } catch (err) {
+    msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
+  }
+}
+
+function bindLongMirror() {
+  const inp = q('lmTpIn');
+  const apply = () => {
+    const v = parseFloat(inp.value);
+    if (!isFinite(v) || v < 0) {
+      const msg = q('lmMsg'); msg.className = 'msg negative';
+      msg.textContent = 'El TP debe ser 0 o un número positivo';
+      return;
+    }
+    if (_lm && n(_lm.tp_usd) === v) return;
+    setLongMirror({ tp_usd: v });
+  };
+  inp.addEventListener('change', apply);
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') { apply(); inp.blur(); } });
+  q('lmMatch').addEventListener('change', async e => {
+    e.target.dataset.busy = '1';
+    await setLongMirror({ match_short: e.target.checked });
+    delete e.target.dataset.busy;
+  });
+}
+
 // ── Venganza ────────────────────────────────────────────────────────────────
 let _rv = null;
 function _rvInput(id, v, dec) {
@@ -3907,6 +4072,7 @@ document.addEventListener('DOMContentLoaded', () => {
     e.target.dataset.dirty = '1';
     setTxt('longSlMsg', '');
   });
+  bindLongMirror();
   q('exSave').addEventListener('click', saveExecutor);
   q('exTest').addEventListener('click', testExecutor);
   q('exInput').addEventListener('input', () => { q('exInput').dataset.dirty = '1'; });
@@ -4320,6 +4486,32 @@ def api_set_long_sl():
     if busy:
         return busy
     return jsonify({"ok": True, "reference": bot.set_long_sl_reference(reference)})
+
+
+@app.post("/api/set-long-mirror")
+def api_set_long_mirror():
+    """Long espejo en caliente: {"match_short": bool, "tp_usd": 1.0}.
+    match_short=true → entra con el notional acumulado del short; tp_usd=0 → sin TP propio."""
+    data = request.get_json(silent=True) or {}
+    match_short = tp_usd = None
+    try:
+        if data.get("match_short") is not None:
+            if not isinstance(data["match_short"], bool):
+                return jsonify({"ok": False, "error": "match_short debe ser true o false"}), 400
+            match_short = data["match_short"]
+        if data.get("tp_usd") is not None:
+            tp_usd = float(data["tp_usd"])
+            if not isfinite(tp_usd) or not 0 <= tp_usd <= LONG_MIRROR_TP_MAX:
+                return jsonify({"ok": False,
+                                "error": f"El TP del long debe estar entre 0 y {LONG_MIRROR_TP_MAX:g} USD (0 = sin TP propio)"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Valor inválido"}), 400
+    if match_short is None and tp_usd is None:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    busy = _not_owner_response()
+    if busy:
+        return busy
+    return jsonify({"ok": True, **bot.set_long_mirror_settings(match_short, tp_usd)})
 
 
 @app.get("/health")
